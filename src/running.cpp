@@ -6,17 +6,23 @@
 #include "SSystem/SComponent/c_m3d.h"
 #include "mods/service.hpp"
 #include "mods/svc/hook.hpp"
+#include "mods/svc/log.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_meter2_draw.h"
+#include "d/d_meter2_info.h"
 #include "run_hold.hpp"
+#include <cstdio>
 namespace twilight_visuals::running {
 namespace {
 RunHold aButton;
 daAlink_c* inputPlayer = nullptr;
 bool inputSampled = false;
+s16 pendingRollAngle = 0;
 daAlink_c* rollChainPlayer = nullptr;
 bool previousUpdateStartedRolling = false;
 bool justFinishedRoll = false;
+unsigned transformTraceFrames = 0;
+bool* humanWarpRequest = nullptr;
 bool enabled(daAlink_c* p) {
     // Targeting owns A's normal roll/evade actions, even without a locked actor.
     // Also respect switch-targeting, where lock-on outlasts the physical press.
@@ -48,13 +54,65 @@ DEFINE_HOOK(&daAlink_c::procStepMove, StepMove);
 DEFINE_HOOK(&daAlink_c::setSandShapeOffset, SandSink);
 DEFINE_HOOK(&daAlink_c::setBlendMoveAnime, MoveAnimation);
 DEFINE_HOOK(&daAlink_c::checkSlope, AnimationSlope);
+DEFINE_HOOK(&daAlink_c::procCoMetamorphoseInit, TransformInit);
 unsigned moveAnimationDepth = 0;
 daAlink_c* sprintRollPlayer = nullptr;
 f32 sprintRollSpeed = 0.0f;
 
+void trace_transform(daAlink_c* p, const char* point, int result) {
+    if (!svc_log) return;
+    char message[768];
+    const auto* event = dComIfGp_getEvent();
+    std::snprintf(message, sizeof(message),
+        "TransformTrace %s result=%d proc=%d wolf=%d clothesTimer=%d phase=%d finished=%d wait=%d "
+        "anim=%.2f demoMode=%d demoType=%d event=%d compulsory=%d map=%d nextStage=%d "
+        "humanWarp=%d ground=%d",
+        point, result, static_cast<int>(p->mProcID), !!p->checkWolf(),
+        static_cast<int>(p->mClothesChangeWaitTimer),
+        static_cast<int>(p->mProcVar0.field_0x3008),
+        static_cast<int>(p->mProcVar5.field_0x3012),
+        static_cast<int>(p->mProcVar1.field_0x300a),
+        static_cast<double>(p->mUnderFrameCtrl[0].getFrame()),
+        static_cast<int>(p->mDemo.getDemoMode()), static_cast<int>(p->mDemo.getDemoType()),
+        !!p->checkEventRun(), static_cast<int>(dComIfGp_getEvent()->checkCompulsory()),
+        static_cast<int>(dMeter2Info_getMapStatus()), !!dComIfGp_isEnableNextStage(),
+        humanWarpRequest ? static_cast<int>(*humanWarpRequest) : -1,
+        !!p->mLinkAcch.ChkGroundHit());
+    svc_log->info(mod_ctx, message);
+}
+HookAction transform_init_pre(ModContext*, void* args, void*, void*) {
+    transformTraceFrames = 0;
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    trace_transform(p, "init-enter", -1);
+    // The reproduced map-glitch softlock enters from idle, with no event,
+    // but still has the Warp as Human request latched. A genuine warp's
+    // scripted transformation is already in an event and must retain it.
+    // Do not require map=0: the glitch specifically leaves map=1 behind.
+    if (active() && humanWarpRequest && *humanWarpRequest &&
+        !p->checkWolf() && !p->checkEventRun() &&
+        !dComIfGp_isEnableNextStage() &&
+        (p->mProcID == daAlink_c::PROC_WAIT || p->mProcID == daAlink_c::PROC_MOVE)) {
+        *humanWarpRequest = false;
+        if (svc_log) svc_log->info(mod_ctx,
+            "TransformTrace cleared stale human-warp request for voluntary transformation.");
+    }
+    return HOOK_CONTINUE;
+}
+void transform_init_post(ModContext*, void* args, void* retval, void*) {
+    trace_transform(mods::arg<daAlink_c*>(args, 0), "init-return", *static_cast<int*>(retval));
+}
+
 HookAction input_pre(ModContext*, void* args, void*, void*) {
     if (!compat::host_api()->simulationFrame()) return HOOK_CONTINUE;
     auto* p = mods::arg<daAlink_c*>(args, 0);
+    if (p->mProcID == daAlink_c::PROC_METAMORPHOSE ||
+        p->mProcID == daAlink_c::PROC_METAMORPHOSE_ONLY) {
+        if (transformTraceFrames < 900 && transformTraceFrames++ % 30 == 0)
+            trace_transform(p, "progress", -1);
+    } else if (transformTraceFrames) {
+        trace_transform(p, "exit", -1);
+        transformTraceFrames = 0;
+    }
     if (!enabled(p)) aButton = {};
     const bool rolling = p->mProcID == daAlink_c::PROC_FRONT_ROLL;
     justFinishedRoll = rollChainPlayer == p && previousUpdateStartedRolling && !rolling;
@@ -74,6 +132,18 @@ HookAction move_action_pre(ModContext*, void* args, void* retval, void*) {
     }
     const bool normalMovement = p->mProcID == daAlink_c::PROC_MOVE ||
         p->mProcID == daAlink_c::PROC_WAIT;
+    const auto status = dComIfGp_getDoStatus();
+    // Below the native roll-stick threshold the HUD can have no action.
+    // A deliberate directional A press should still roll, without charging.
+    if (enabled(p) && normalMovement && p->doTrigger() && p->checkInputOnR() &&
+        p->mStickValue <= p->getFrontRollRate() &&
+        (status == BUTTON_STATUS_NONE || status == BUTTON_STATUS_UNK_121) &&
+        grounded(p) && !p->checkMagneBootsOn() && !p->checkNotJumpSinkLimit()) {
+        aButton = {};
+        p->shape_angle.y = p->mMoveAngle;
+        *static_cast<BOOL*>(retval) = p->procFrontRollInit();
+        return HOOK_SKIP_ORIGINAL;
+    }
     // A new roll-chain press must reach vanilla on its trigger frame, not
     // enter Ready and wait for release. Vanilla still enforces cancel timing.
     if (enabled(p) && dComIfGp_getDoStatus() == BUTTON_STATUS_UNK_121 &&
@@ -88,13 +158,17 @@ HookAction move_action_pre(ModContext*, void* args, void* retval, void*) {
     // This hook runs after the game builds mItemButton/mItemTrigger.
     const bool eligible = enabled(p) &&
         ((normalMovement && dComIfGp_getDoStatus() == BUTTON_STATUS_UNK_121) ||
+         (normalMovement && aButton.state == RunHold::State::Ready &&
+             status == BUTTON_STATUS_NONE) ||
          (aButton.running() && (normalMovement ||
              p->mProcID == daAlink_c::PROC_FRONT_ROLL ||
              p->mProcID == daAlink_c::PROC_STEP_MOVE)));
+    if (eligible && aButton.state == RunHold::State::Idle && p->doTrigger())
+        pendingRollAngle = p->checkInputOnR() ? p->mMoveAngle : p->shape_angle.y;
     if (aButton.update(p->doTrigger(), p->doButton(), eligible,
                        p->mpHIO->mWolf.mWlAttack.m.mReadyInterpolation)) {
         if (grounded(p) && !p->checkMagneBootsOn()) {
-            if (p->checkInputOnR()) p->shape_angle.y = p->mMoveAngle;
+            p->shape_angle.y = p->checkInputOnR() ? p->mMoveAngle : pendingRollAngle;
             *static_cast<BOOL*>(retval) = p->procFrontRollInit();
             return HOOK_SKIP_ORIGINAL;
         }
@@ -241,6 +315,21 @@ void animation(void* raw, DuskPlayerAnimationEvent point, s32* value, f32* rate)
 }
 }
 void initialize() {
+    // This host data symbol is not directly exported; use the mod resolver.
+    void* warpAddress = nullptr;
+    HookSymbolFlags warpFlags{};
+    if (svc_hook->resolve(mod_ctx, "?sDuskHumanWarpRequest@daAlink_c@@2_NA",
+                          &warpAddress, &warpFlags) == MOD_OK &&
+        (warpFlags & HOOK_SYMBOL_DATA)) {
+        humanWarpRequest = static_cast<bool*>(warpAddress);
+    } else {
+        if (svc_log) svc_log->warn(mod_ctx, "TransformTrace: human-warp flag unavailable; other diagnostics remain active.");
+    }
+    const auto tracePre = mods::hook::add_pre<TransformInit>(transform_init_pre);
+    const auto tracePost = mods::hook::add_post<TransformInit>(transform_init_post);
+    if (svc_log) svc_log->info(mod_ctx, tracePre == MOD_OK && tracePost == MOD_OK ?
+        "TransformTrace enabled; guarded voluntary-transformation warp-flag fix active." :
+        "TransformTrace initialization hook unavailable.");
     mods::hook::add_pre<MoveAnimation>(move_animation_pre);
     mods::hook::add_post<MoveAnimation>(move_animation_post);
     mods::hook::add_pre<AnimationSlope>(animation_slope_pre);
@@ -260,6 +349,9 @@ bool is_running() {
     return p && moving(p) && grounded(p);
 }
 void shutdown() {
+    humanWarpRequest = nullptr;
+    transformTraceFrames = 0;
+    mods::hook::uninstall<TransformInit>();
     mods::hook::uninstall<AnimationSlope>();
     mods::hook::uninstall<MoveAnimation>();
     moveAnimationDepth = 0;
