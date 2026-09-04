@@ -1,6 +1,7 @@
 #include "particles.hpp"
 #include "native_particles.hpp"
 #include "blood.hpp"
+#include "run_trail.hpp"
 #include "compat.hpp"
 #include "runtime.hpp"
 #include "mods/service.hpp"
@@ -75,6 +76,7 @@ void destroy_packet() {
 }
 
 void move_post(ModContext*, void*, void*, void*) {
+    run_trail::move();
     blood::move();
     u8* texture = static_cast<u8*>(dComIfG_getObjectRes("Always", 0x5E));
     if (!enabled() || texture == nullptr) {
@@ -116,6 +118,7 @@ HookAction draw_pre(ModContext*, void*, void*, void*) {
 }
 
 void draw_post(ModContext*, void*, void*, void*) {
+    run_trail::draw();
     blood::draw();
     if (g_nativeHousiDrawSuppressed) {
         g_env_light.mHousiInitialized = g_savedHousiInitialized;
@@ -145,6 +148,7 @@ ModResult install_hooks() {
     return mods::hook::add_post<WeatherDraw>(draw_post);
 }
 void uninstall_hooks() {
+    run_trail::clear();
     if (g_nativeHousiDrawSuppressed) {
         g_env_light.mHousiInitialized = g_savedHousiInitialized;
         g_nativeHousiDrawSuppressed = false;
@@ -154,5 +158,5 @@ void uninstall_hooks() {
     destroy_packet();
     restore_native_particles();
 }
-void area_reloaded() { g_savedNativeState = false; }
+void area_reloaded() { g_savedNativeState = false; run_trail::clear(); }
 }

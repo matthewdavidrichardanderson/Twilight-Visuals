@@ -41,6 +41,7 @@ DEFINE_HOOK(&daAlink_c::execute, PlayerExecute);
 DEFINE_HOOK(&daAlink_c::checkMoveDoAction, MoveAction);
 DEFINE_HOOK(&dMeter2Draw_c::getActionString, ActionString);
 DEFINE_HOOK(&daAlink_c::procStepMove, StepMove);
+DEFINE_HOOK(&daAlink_c::setSandShapeOffset, SandSink);
 daAlink_c* sprintRollPlayer = nullptr;
 f32 sprintRollSpeed = 0.0f;
 
@@ -96,6 +97,18 @@ HookAction move_action_pre(ModContext*, void* args, void* retval, void*) {
         return HOOK_SKIP_ORIGINAL;
     }
     return HOOK_CONTINUE;
+}
+
+HookAction sand_sink_pre(ModContext*, void* args, void*, void*) {
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    // Only actual SS running on sand bypasses sinking. Snow, other forms,
+    // ordinary movement and released A retain the native sink calculation.
+    if (!moving(p) || !p->mLinkAcch.ChkGroundHit() ||
+        p->mGndPolyAtt0 != 3 || p->checkSnowCode()) return HOOK_CONTINUE;
+    p->mSinkShapeOffset = 0.0f;
+    p->field_0x2fc9 = 0x10;
+    p->mZ2Link.setSinkDepth(-1);
+    return HOOK_SKIP_ORIGINAL;
 }
 
 void step_move_post(ModContext*, void* args, void*, void*) {
@@ -204,6 +217,7 @@ void animation(void* raw, DuskPlayerAnimationEvent point, s32* value, f32* rate)
 }
 }
 void initialize() {
+    mods::hook::add_pre<SandSink>(sand_sink_pre);
     mods::hook::add_post<StepMove>(step_move_post);
     mods::hook::add_post<ActionString>(action_string_post);
     mods::hook::add_pre<MoveAction>(move_action_pre);
@@ -214,7 +228,12 @@ void initialize() {
     const DuskPlayerHooksV1 hooks{invoke,animation};
     compat::host_api()->setPlayerHooks(&hooks);
 }
+bool is_running() {
+    auto* p = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    return p && moving(p) && grounded(p);
+}
 void shutdown() {
+    mods::hook::uninstall<SandSink>();
     mods::hook::uninstall<StepMove>();
     mods::hook::uninstall<ActionString>();
     rollChainPlayer = nullptr;

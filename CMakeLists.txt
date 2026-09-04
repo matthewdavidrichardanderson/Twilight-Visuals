@@ -24,6 +24,7 @@ add_mod(twilight_visuals
         src/boundary.cpp
         src/blood.cpp
         src/running.cpp
+        src/run_trail.cpp
         src/sequencing.cpp
         src/geometry.cpp
         src/monochrome.cpp
