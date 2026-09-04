@@ -6,7 +6,13 @@
 #include "SSystem/SComponent/c_m3d.h"
 namespace twilight_visuals::running {
 namespace {
-bool enabled(daAlink_c* p) { return active() && runtime_settings().skywardSwordRunning && !p->checkWolf() && !p->checkEventRun(); }
+bool enabled(daAlink_c* p) {
+    // Targeting owns A's normal roll/evade actions, even without a locked actor.
+    // Also respect switch-targeting, where lock-on outlasts the physical press.
+    return active() && runtime_settings().skywardSwordRunning &&
+        !p->checkWolf() && !p->checkEventRun() &&
+        !mDoCPd_c::getHoldL(PAD_1) && !p->checkAttentionLock();
+}
 bool held(daAlink_c* p) { return enabled(p) && mDoCPd_c::getHoldA(PAD_1); }
 bool moving(daAlink_c* p) { return held(p) && p->mProcID == daAlink_c::PROC_MOVE && p->mStickValue > 0.1f; }
 bool water(daAlink_c* p) {
