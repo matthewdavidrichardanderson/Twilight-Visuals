@@ -46,6 +46,9 @@ DEFINE_HOOK(&daAlink_c::checkMoveDoAction, MoveAction);
 DEFINE_HOOK(&dMeter2Draw_c::getActionString, ActionString);
 DEFINE_HOOK(&daAlink_c::procStepMove, StepMove);
 DEFINE_HOOK(&daAlink_c::setSandShapeOffset, SandSink);
+DEFINE_HOOK(&daAlink_c::setBlendMoveAnime, MoveAnimation);
+DEFINE_HOOK(&daAlink_c::checkSlope, AnimationSlope);
+unsigned moveAnimationDepth = 0;
 daAlink_c* sprintRollPlayer = nullptr;
 f32 sprintRollSpeed = 0.0f;
 
@@ -97,6 +100,23 @@ HookAction move_action_pre(ModContext*, void* args, void* retval, void*) {
         }
     }
     if (eligible && aButton.state != RunHold::State::Idle) {
+        *static_cast<BOOL*>(retval) = FALSE;
+        return HOOK_SKIP_ORIGINAL;
+    }
+    return HOOK_CONTINUE;
+}
+
+HookAction move_animation_pre(ModContext*, void*, void*, void*) {
+    ++moveAnimationDepth;
+    return HOOK_CONTINUE;
+}
+void move_animation_post(ModContext*, void*, void*, void*) {
+    if (moveAnimationDepth) --moveAnimationDepth;
+}
+HookAction animation_slope_pre(ModContext*, void* args, void* retval, void*) {
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    // Suppress only the slope-walk animation branch, not terrain physics.
+    if (moveAnimationDepth && moving(p) && grounded(p)) {
         *static_cast<BOOL*>(retval) = FALSE;
         return HOOK_SKIP_ORIGINAL;
     }
@@ -215,12 +235,15 @@ void animation(void* raw, DuskPlayerAnimationEvent point, s32* value, f32* rate)
     if (point == DuskPlayerAnimation_HeavyMovement && (invoke(p, DuskPlayer_HeavyBootsRunning,0) || (snow(p) && moving(p)))) *value = 0;
     if (point == DuskPlayerAnimation_Run && moving(p)) *value = daAlink_c::ANM_RUN_B;
     if (point == DuskPlayerAnimation_HeavyRun && invoke(p, DuskPlayer_HeavyBootsRunning,0)) {
-        *value = p->checkSlope() ? daAlink_c::ANM_WALK_SLOPE : daAlink_c::ANM_RUN_B;
+        *value = daAlink_c::ANM_RUN_B;
         if (rate) *rate *= 0.70f;
     }
 }
 }
 void initialize() {
+    mods::hook::add_pre<MoveAnimation>(move_animation_pre);
+    mods::hook::add_post<MoveAnimation>(move_animation_post);
+    mods::hook::add_pre<AnimationSlope>(animation_slope_pre);
     mods::hook::add_pre<SandSink>(sand_sink_pre);
     mods::hook::add_post<StepMove>(step_move_post);
     mods::hook::add_post<ActionString>(action_string_post);
@@ -237,6 +260,9 @@ bool is_running() {
     return p && moving(p) && grounded(p);
 }
 void shutdown() {
+    mods::hook::uninstall<AnimationSlope>();
+    mods::hook::uninstall<MoveAnimation>();
+    moveAnimationDepth = 0;
     mods::hook::uninstall<SandSink>();
     mods::hook::uninstall<StepMove>();
     mods::hook::uninstall<ActionString>();
