@@ -4,8 +4,18 @@
 #include "d/actor/d_a_alink.h"
 #include "m_Do/m_Do_controller_pad.h"
 #include "SSystem/SComponent/c_m3d.h"
+#include "mods/service.hpp"
+#include "mods/svc/hook.hpp"
+#include "d/d_com_inf_game.h"
+#include "run_hold.hpp"
 namespace twilight_visuals::running {
 namespace {
+RunHold aButton;
+daAlink_c* inputPlayer = nullptr;
+bool inputSampled = false;
+daAlink_c* rollChainPlayer = nullptr;
+bool previousUpdateStartedRolling = false;
+bool justFinishedRoll = false;
 bool enabled(daAlink_c* p) {
     // Targeting owns A's normal roll/evade actions, even without a locked actor.
     // Also respect switch-targeting, where lock-on outlasts the physical press.
@@ -13,7 +23,9 @@ bool enabled(daAlink_c* p) {
         !p->checkWolf() && !p->checkEventRun() &&
         !mDoCPd_c::getHoldL(PAD_1) && !p->checkAttentionLock();
 }
-bool held(daAlink_c* p) { return enabled(p) && mDoCPd_c::getHoldA(PAD_1); }
+bool held(daAlink_c* p) {
+    return enabled(p) && inputPlayer == p && aButton.running() && p->doButton();
+}
 bool moving(daAlink_c* p) { return held(p) && p->mProcID == daAlink_c::PROC_MOVE && p->mStickValue > 0.1f; }
 bool water(daAlink_c* p) {
     if (!held(p) || !p->checkMagicArmorWearAbility() || p->checkMagneBootsOn() || p->mWaterY == -G_CM3D_F_INF) return false;
@@ -22,11 +34,93 @@ bool water(daAlink_c* p) {
 }
 bool grounded(daAlink_c* p) { return (p->mLinkAcch.ChkGroundHit() || water(p)) && !p->checkModeFlg(daAlink_c::MODE_SWIMMING); }
 bool snow(daAlink_c* p) { return held(p) && p->checkSnowCode() && !p->checkBootsOrArmorHeavy(); }
+DEFINE_HOOK(&daAlink_c::procFrontRollInit, RollInit);
+DEFINE_HOOK(&daAlink_c::procFrontRoll, RollUpdate);
+DEFINE_HOOK(&daAlink_c::execute, PlayerExecute);
+DEFINE_HOOK(&daAlink_c::checkMoveDoAction, MoveAction);
+daAlink_c* sprintRollPlayer = nullptr;
+f32 sprintRollSpeed = 0.0f;
+
+HookAction input_pre(ModContext*, void* args, void*, void*) {
+    if (!compat::host_api()->simulationFrame()) return HOOK_CONTINUE;
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    const bool rolling = p->mProcID == daAlink_c::PROC_FRONT_ROLL;
+    justFinishedRoll = rollChainPlayer == p && previousUpdateStartedRolling && !rolling;
+    rollChainPlayer = p;
+    previousUpdateStartedRolling = rolling;
+    inputSampled = false;
+    return HOOK_CONTINUE;
+}
+
+HookAction move_action_pre(ModContext*, void* args, void* retval, void*) {
+    if (!compat::host_api()->simulationFrame() || inputSampled) return HOOK_CONTINUE;
+    inputSampled = true;
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    if (inputPlayer != p) {
+        aButton = {};
+        inputPlayer = p;
+    }
+    const bool normalMovement = p->mProcID == daAlink_c::PROC_MOVE ||
+        p->mProcID == daAlink_c::PROC_WAIT;
+    // A new roll-chain press must reach vanilla on its trigger frame, not
+    // enter Ready and wait for release. Vanilla still enforces cancel timing.
+    if (enabled(p) && dComIfGp_getDoStatus() == BUTTON_STATUS_UNK_121 &&
+        nativeRollChainPress(p->doTrigger(),
+            p->mProcID == daAlink_c::PROC_FRONT_ROLL,
+            justFinishedRoll && normalMovement)) {
+        aButton = {};
+        return HOOK_CONTINUE;
+    }
+    // Mirror procWolfRollAttackCharge's release-before-charge decision, using
+    // its ready interpolation duration without changing Link's animation.
+    // This hook runs after the game builds mItemButton/mItemTrigger.
+    const bool eligible = enabled(p) &&
+        ((normalMovement && dComIfGp_getDoStatus() == BUTTON_STATUS_UNK_121) ||
+         (aButton.running() && p->mProcID == daAlink_c::PROC_FRONT_ROLL));
+    if (aButton.update(p->doTrigger(), p->doButton(), eligible,
+                       p->mpHIO->mWolf.mWlAttack.m.mReadyInterpolation)) {
+        if (grounded(p) && !p->checkMagneBootsOn()) {
+            if (p->checkInputOnR()) p->shape_angle.y = p->mMoveAngle;
+            *static_cast<BOOL*>(retval) = p->procFrontRollInit();
+            return HOOK_SKIP_ORIGINAL;
+        }
+    }
+    if (eligible && aButton.state != RunHold::State::Idle) {
+        *static_cast<BOOL*>(retval) = FALSE;
+        return HOOK_SKIP_ORIGINAL;
+    }
+    return HOOK_CONTINUE;
+}
+
+HookAction roll_pre(ModContext*, void* args, void*, void*) {
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    // Capture before vanilla initialization caps the roll's entry speed.
+    sprintRollPlayer = moving(p) && grounded(p) ? p : nullptr;
+    sprintRollSpeed = sprintRollPlayer ? p->mNormalSpeed : 0.0f;
+    return HOOK_CONTINUE;
+}
+
+void roll_post(ModContext*, void* args, void*, void*) {
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    if (p != sprintRollPlayer) return;
+    // Never carry momentum into a crash, another action, or a disabled mod.
+    if (!enabled(p) || p->mProcID != daAlink_c::PROC_FRONT_ROLL ||
+        !p->mLinkAcch.ChkGroundHit() || p->mLinkAcch.ChkWallHit()) {
+        sprintRollPlayer = nullptr;
+        return;
+    }
+    cM3dGPla poly;
+    if (p->getSlidePolygon(&poly)) {
+        sprintRollPlayer = nullptr;
+        return;
+    }
+    p->mNormalSpeed = sprintRollSpeed;
+}
 s32 invoke(void* raw, DuskPlayerEvent point, f32 value) {
     auto* p = static_cast<daAlink_c*>(raw);
     if (!p) return 0;
     switch (point) {
-    case DuskPlayer_RunEnabled: return enabled(p);
+    case DuskPlayer_RunEnabled: return held(p);
     case DuskPlayer_IsRunning: return moving(p);
     case DuskPlayer_HeavyBootsRunning: return moving(p) && p->checkEquipHeavyBoots() && grounded(p);
     case DuskPlayer_SnowRunning: return snow(p);
@@ -76,8 +170,25 @@ void animation(void* raw, DuskPlayerAnimationEvent point, s32* value, f32* rate)
 }
 }
 void initialize() {
+    mods::hook::add_pre<MoveAction>(move_action_pre);
+    mods::hook::add_pre<PlayerExecute>(input_pre);
+    mods::hook::add_pre<RollInit>(roll_pre);
+    mods::hook::add_post<RollInit>(roll_post);
+    mods::hook::add_post<RollUpdate>(roll_post);
     const DuskPlayerHooksV1 hooks{invoke,animation};
     compat::host_api()->setPlayerHooks(&hooks);
 }
-void shutdown() { compat::host_api()->setPlayerHooks(nullptr); }
+void shutdown() {
+    rollChainPlayer = nullptr;
+    previousUpdateStartedRolling = false;
+    justFinishedRoll = false;
+    mods::hook::uninstall<MoveAction>();
+    aButton = {};
+    inputPlayer = nullptr;
+    mods::hook::uninstall<PlayerExecute>();
+    sprintRollPlayer = nullptr;
+    mods::hook::uninstall<RollUpdate>();
+    mods::hook::uninstall<RollInit>();
+    compat::host_api()->setPlayerHooks(nullptr);
+}
 }
