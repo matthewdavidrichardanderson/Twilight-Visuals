@@ -7,6 +7,7 @@
 #include "mods/service.hpp"
 #include "mods/svc/hook.hpp"
 #include "d/d_com_inf_game.h"
+#include "d/d_meter2_draw.h"
 #include "run_hold.hpp"
 namespace twilight_visuals::running {
 namespace {
@@ -38,12 +39,15 @@ DEFINE_HOOK(&daAlink_c::procFrontRollInit, RollInit);
 DEFINE_HOOK(&daAlink_c::procFrontRoll, RollUpdate);
 DEFINE_HOOK(&daAlink_c::execute, PlayerExecute);
 DEFINE_HOOK(&daAlink_c::checkMoveDoAction, MoveAction);
+DEFINE_HOOK(&dMeter2Draw_c::getActionString, ActionString);
+DEFINE_HOOK(&daAlink_c::procStepMove, StepMove);
 daAlink_c* sprintRollPlayer = nullptr;
 f32 sprintRollSpeed = 0.0f;
 
 HookAction input_pre(ModContext*, void* args, void*, void*) {
     if (!compat::host_api()->simulationFrame()) return HOOK_CONTINUE;
     auto* p = mods::arg<daAlink_c*>(args, 0);
+    if (!enabled(p)) aButton = {};
     const bool rolling = p->mProcID == daAlink_c::PROC_FRONT_ROLL;
     justFinishedRoll = rollChainPlayer == p && previousUpdateStartedRolling && !rolling;
     rollChainPlayer = p;
@@ -76,7 +80,9 @@ HookAction move_action_pre(ModContext*, void* args, void* retval, void*) {
     // This hook runs after the game builds mItemButton/mItemTrigger.
     const bool eligible = enabled(p) &&
         ((normalMovement && dComIfGp_getDoStatus() == BUTTON_STATUS_UNK_121) ||
-         (aButton.running() && p->mProcID == daAlink_c::PROC_FRONT_ROLL));
+         (aButton.running() && (normalMovement ||
+             p->mProcID == daAlink_c::PROC_FRONT_ROLL ||
+             p->mProcID == daAlink_c::PROC_STEP_MOVE)));
     if (aButton.update(p->doTrigger(), p->doButton(), eligible,
                        p->mpHIO->mWolf.mWlAttack.m.mReadyInterpolation)) {
         if (grounded(p) && !p->checkMagneBootsOn()) {
@@ -90,6 +96,31 @@ HookAction move_action_pre(ModContext*, void* args, void* retval, void*) {
         return HOOK_SKIP_ORIGINAL;
     }
     return HOOK_CONTINUE;
+}
+
+void step_move_post(ModContext*, void* args, void*, void*) {
+    if (!compat::host_api()->simulationFrame()) return;
+    auto* p = mods::arg<daAlink_c*>(args, 0);
+    if (inputPlayer != p) return;
+    // Observe release even before the climb's normal action/cancel window.
+    if (!enabled(p) || !p->doButton()) {
+        aButton = {};
+        return;
+    }
+    // Leave the climb animation and placement alone; resume speed on exit.
+    if (moving(p) && grounded(p)) {
+        p->mNormalSpeed = 45.0f * (p->checkEquipHeavyBoots() ? 0.70f : 1.0f);
+    }
+}
+
+void action_string_post(ModContext*, void* args, void* retval, void*) {
+    // Display-only override: leave the native Roll status intact for gameplay.
+    if (mods::arg<u8>(args, 1) != BUTTON_STATUS_UNK_121) return;
+    auto* p = static_cast<daAlink_c*>(dComIfGp_getLinkPlayer());
+    if (!p || !enabled(p)) return;
+    if (p->mProcID != daAlink_c::PROC_MOVE && p->mProcID != daAlink_c::PROC_WAIT) return;
+    static char runText[] = "Run";
+    *static_cast<char**>(retval) = runText;
 }
 
 HookAction roll_pre(ModContext*, void* args, void*, void*) {
@@ -130,12 +161,15 @@ s32 invoke(void* raw, DuskPlayerEvent point, f32 value) {
         (p->field_0x2f91 == 7 || p->field_0x2f91 == 8 || p->field_0x2f91 == 9);
     case DuskPlayer_JumpMode: return moving(p) && !p->checkMagneBootsOn() && !p->checkModeFlg(daAlink_c::MODE_SWIMMING) ? 2 : 0;
     case DuskPlayer_UpdateRunSpeed:
-        if (moving(p) && grounded(p)) p->mNormalSpeed = 37.0f * (p->checkEquipHeavyBoots() ? 0.70f : 1.0f);
+        if (moving(p) && grounded(p)) p->mNormalSpeed = 45.0f * (p->checkEquipHeavyBoots() ? 0.70f : 1.0f);
         break;
     case DuskPlayer_UpdateSnowSpeed:
         if (snow(p)) { p->mStickValue = value; p->mHeavySpeedMultiplier = 1.0f; }
         break;
     case DuskPlayer_HandleRunAction:
+        // A release restores contextual input even if the move-action hook is
+        // bypassed by a higher-priority interaction during this update.
+        if (inputPlayer == p && aButton.running() && !p->doButton()) aButton = {};
         if (moving(p) && grounded(p) && !p->checkMagneBootsOn()) {
             if (p->spActionTrigger()) return p->procFrontRollInit();
             if (p->swordTrigger()) {
@@ -170,6 +204,8 @@ void animation(void* raw, DuskPlayerAnimationEvent point, s32* value, f32* rate)
 }
 }
 void initialize() {
+    mods::hook::add_post<StepMove>(step_move_post);
+    mods::hook::add_post<ActionString>(action_string_post);
     mods::hook::add_pre<MoveAction>(move_action_pre);
     mods::hook::add_pre<PlayerExecute>(input_pre);
     mods::hook::add_pre<RollInit>(roll_pre);
@@ -179,6 +215,8 @@ void initialize() {
     compat::host_api()->setPlayerHooks(&hooks);
 }
 void shutdown() {
+    mods::hook::uninstall<StepMove>();
+    mods::hook::uninstall<ActionString>();
     rollChainPlayer = nullptr;
     previousUpdateStartedRolling = false;
     justFinishedRoll = false;
