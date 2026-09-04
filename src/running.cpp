@@ -28,6 +28,10 @@ bool held(daAlink_c* p) {
     return enabled(p) && inputPlayer == p && aButton.running() && p->doButton();
 }
 bool moving(daAlink_c* p) { return held(p) && p->mProcID == daAlink_c::PROC_MOVE && p->mStickValue > 0.1f; }
+f32 run_speed(daAlink_c* p) {
+    const bool indoors = p->checkRoom() || p->checkDungeon() || p->checkBossRoom();
+    return (indoors ? 37.0f : 45.0f) * (p->checkEquipHeavyBoots() ? 0.70f : 1.0f);
+}
 bool water(daAlink_c* p) {
     if (!held(p) || !p->checkMagicArmorWearAbility() || p->checkMagneBootsOn() || p->mWaterY == -G_CM3D_F_INF) return false;
     const f32 offset = p->mWaterY - p->current.pos.y;
@@ -122,7 +126,7 @@ void step_move_post(ModContext*, void* args, void*, void*) {
     }
     // Leave the climb animation and placement alone; resume speed on exit.
     if (moving(p) && grounded(p)) {
-        p->mNormalSpeed = 45.0f * (p->checkEquipHeavyBoots() ? 0.70f : 1.0f);
+        p->mNormalSpeed = run_speed(p);
     }
 }
 
@@ -174,7 +178,7 @@ s32 invoke(void* raw, DuskPlayerEvent point, f32 value) {
         (p->field_0x2f91 == 7 || p->field_0x2f91 == 8 || p->field_0x2f91 == 9);
     case DuskPlayer_JumpMode: return moving(p) && !p->checkMagneBootsOn() && !p->checkModeFlg(daAlink_c::MODE_SWIMMING) ? 2 : 0;
     case DuskPlayer_UpdateRunSpeed:
-        if (moving(p) && grounded(p)) p->mNormalSpeed = 45.0f * (p->checkEquipHeavyBoots() ? 0.70f : 1.0f);
+        if (moving(p) && grounded(p)) p->mNormalSpeed = run_speed(p);
         break;
     case DuskPlayer_UpdateSnowSpeed:
         if (snow(p)) { p->mStickValue = value; p->mHeavySpeedMultiplier = 1.0f; }
